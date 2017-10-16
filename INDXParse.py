@@ -38,6 +38,7 @@ import argparse
 
 g_logger = logging.getLogger("INDXParse")
 INDEX_NODE_BLOCK_SIZE = 4096
+INDEX_ENTRY_IS_DIRECTORY = 0x20
 
 
 def parse_windows_timestamp(qword):
@@ -342,7 +343,8 @@ class NTATTR_STANDARD_INDEX_HEADER(Block):
         A generator that returns each INDX entry associated with
           this header.
         """
-        if self.entry_offset() - self.offset() >= self.entry_size():
+        off = self.entry_offset()
+        if off - self.offset() >= self.entry_size():
             g_logger.debug("No entries in this allocation block.")
             return
 
@@ -369,12 +371,12 @@ class NTATTR_STANDARD_INDEX_HEADER(Block):
         #  reference should be.
         # TODO: this only works for directory indices (depends on
         #  parent reference field interpretation)
-        if ("\x00" * 8) == self._buf[self.entry_offset():self.entry_offset() + 8].tostring():
+        if (b'\x00' * 8) == self._buf[off:off + 8].tostring():
             # 0x18 is relative offset from NTATTR_STANARD_INDEX_HEADER to
             #  the INDEX_HEADER sub-struct
-            e = entry_class(self._buf, 0x18 + self.entry_offset(), self)
+            e = entry_class(self._buf, 0x18 + off, self)
         else:
-            e = entry_class(self._buf, self.entry_offset(), self)
+            e = entry_class(self._buf, off, self)
 
         yield e
 
@@ -625,30 +627,31 @@ class NTATTR_SII_INDEX_ENTRY(NTATTR_STANDARD_INDEX_ENTRY):
 
 
 class NTATTR_DIRECTORY_INDEX_ENTRY(NTATTR_STANDARD_INDEX_ENTRY):
-# 0x0    LONGLONG mftReference;
+    # 0x0    6 byte mftReference.record_number;
+    # 0x6    2 byte mftReference.sequence_number
 
-# 0x8    unsigned short sizeOfIndexEntry;
-# 0xA    unsigned short sizeOfStream;
-# 0xC    unsigned short flags;
-# 0xE    BYTE padding[2];
+    # 0x8    unsigned short sizeOfIndexEntry;
+    # 0xA    unsigned short sizeOfStream;
+    # 0xC    unsigned short flags;
+    # 0xE    BYTE padding[2];
 
-# FILENAME_INFORMATION
-# 0x10    LONGLONG refParentDirectory;
-# 0x18    FILETIME creationTime;
-# 0x20    FILETIME lastModifiedTime;
-# 0x28    FILETIME MFTRecordChangeTime;
-# 0x30    FILETIME lastAccessTime;
-# 0x38    LONGLONG physicalSizeOfFile;
-# 0x40    LONGLONG logicalSizeOfFile;
-# 0x48    DWORD    flags;
-# 0x4C    DWORD    extendedAttributes;
+    # FILENAME_INFORMATION
+    # 0x10    LONGLONG refParentDirectory;
+    # 0x18    FILETIME creationTime;
+    # 0x20    FILETIME lastModifiedTime;
+    # 0x28    FILETIME MFTRecordChangeTime;
+    # 0x30    FILETIME lastAccessTime;
+    # 0x38    LONGLONG physicalSizeOfFile;
+    # 0x40    LONGLONG logicalSizeOfFile;
+    # 0x48    DWORD    flags;
+    # 0x4C    DWORD    extendedAttributes;
 
-# 0x50    unsigned BYTE filenameLength;
-# 0x51    NTFS_FNAME_NSPACE filenameType;
+    # 0x50    unsigned BYTE filenameLength;
+    # 0x51    NTFS_FNAME_NSPACE filenameType;
 
-# 0x52    wchar_t filename[filenameLength];
+    # 0x52    wchar_t filename[filenameLength];
 
-# 0xXX    Padding to 8-byte boundary
+    # 0xXX    Padding to 8-byte boundary
 
     def __init__(self, buf, offset, parent):
         """
@@ -662,6 +665,7 @@ class NTATTR_DIRECTORY_INDEX_ENTRY(NTATTR_STANDARD_INDEX_ENTRY):
         g_logger.debug("ENTRY at %x.", offset)
         super(NTATTR_DIRECTORY_INDEX_ENTRY, self).__init__(buf, offset, parent)
 
+        self._mft_reference_offset = 0x00
         self._created_time_offset = 0x18
         self._modified_time_offset = 0x20
         self._changed_time_offset = 0x28
@@ -670,12 +674,22 @@ class NTATTR_DIRECTORY_INDEX_ENTRY(NTATTR_STANDARD_INDEX_ENTRY):
         self._physical_size_offset = 0x38
         self._logical_size_offset = 0x40
 
+        self._flags_offset = 0x48
+
         self._filename_length_offset = 0x50
         self._filename_type_offset = 0x51
         self._filename_offset = 0x52
 
         # through empirical testing, recovering the filename type
         #   of slack entries doesn't work well
+    def mft_record_number(self):
+        _ref = self.unpack_qword(self._mft_reference_offset)
+        # record number is 48bit integer
+        # but we can only unpack 64bit or 32bit int
+        return _ref & 0x0000ffffffffffff
+
+    def flags(self):
+        return self.unpack_dword(self._flags_offset)
 
     def end_offset(self):
         """
@@ -761,6 +775,9 @@ class NTATTR_DIRECTORY_INDEX_ENTRY(NTATTR_STANDARD_INDEX_ENTRY):
             return self.unpack_wstring(self._filename_offset, self.unpack_byte(self._filename_length_offset))
         except UnicodeDecodeError:
             return "UNKNOWN FILE NAME"
+
+    def is_directory(self):
+        return self.flags() & INDEX_ENTRY_IS_DIRECTORY
 
 
 class NTATTR_DIRECTORY_INDEX_SLACK_ENTRY(NTATTR_DIRECTORY_INDEX_ENTRY):
